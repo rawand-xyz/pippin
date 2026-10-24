@@ -202,8 +202,118 @@ function fullscreen(vdisplay: boolean, macDisplay = false): Scenario {
   };
 }
 
+/**
+ * Opens the guest tool `name` (e2e/guest/<name>.swift) as an app in the login
+ * session, with its log file and `args`, and waits until it logs `ready`.
+ * Returns a reader of the lines of its log, which also goes to the output
+ * folder at the end.
+ */
+async function openTool(ctx: Context, name: string, args: string[] = []): Promise<() => Promise<string[]>> {
+  const app = `/tmp/${name}.app`;
+  const log = `/tmp/${name}.log`;
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>${name}</string>
+<key>CFBundleIdentifier</key><string>dev.rubas.${name}</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+`;
+  await ctx.guest.sh(`mkdir -p ${app}/Contents/MacOS && : >${log}`);
+  await ctx.guest.put(`${app}/Contents/Info.plist`, plist);
+  await ctx.guest.put(`${app}/Contents/MacOS/${name}`, await swiftTool(name), "755");
+  await ctx.guest.sh(`open -n ${app} --args ${[log, ...args].join(" ")}`);
+  const read = async () => (await ctx.guest.sh(`cat ${log}`)).split("\n").filter(Boolean);
+  ctx.onTeardown(async () => Bun.write(`${ctx.out}/${name}.log`, await ctx.guest.sh(`cat ${log}`)));
+  await waitFor(`${name} to show its window`, 20_000, async () => (await read()).includes("ready") || undefined);
+  return read;
+}
+
+/** A scroll event that reached scrolllog, with the sign of the device: a positive x is left, a positive y up. */
+type Scrolled = { x: number; y: number };
+
+function scrolled(lines: string[]): Scrolled[] {
+  return lines
+    .filter((l) => l.startsWith("scroll "))
+    .map((l) => {
+      const [, x, y] = l.split(" ");
+      return { x: Number(x), y: Number(y) };
+    });
+}
+
+const scroll: Scenario = {
+  about: "scroll down and right with the control FIFO, and see both reach a window on the Mac",
+  async run(ctx) {
+    await connected(ctx, ["WindowServer", "screensharingd"], false, async (session) => {
+      // After the connect, so that the window covers pippin's display.
+      const log = await openTool(ctx, "scrolllog");
+      session.send("pointer 200 200");
+      await Bun.sleep(1000);
+      session.send("scroll 0 3");
+      await Bun.sleep(2000);
+      const vertical = scrolled(await log());
+      session.send("scroll 2 0");
+      await Bun.sleep(2000);
+      const horizontal = scrolled(await log()).slice(vertical.length);
+      await session.snapshot("1-scrolllog");
+      const show = (events: Scrolled[]) => events.map((e) => `${e.x},${e.y}`).join(" ") || "none";
+      // AppKit can merge scroll events, so the count of events is not the count of steps.
+      const all = (events: Scrolled[], ok: (e: Scrolled) => boolean) => events.length > 0 && events.every(ok);
+      ctx.check("scroll down", all(vertical, (e) => e.x === 0 && e.y < 0), `events ${show(vertical)}`);
+      ctx.check("scroll right", all(horizontal, (e) => e.x < 0 && e.y === 0), `events ${show(horizontal)}`);
+    });
+  },
+};
+
+// Dominic types with Neo 2 on both sides. The VM gets the Mac layout of Neo 2
+// from the mini, in the same place.
+const NEO_LAYOUT = "/Library/Keyboard Layouts/neo.keylayout";
+const NEO = "org.unknown.keylayout.DeutschNeo2";
+// What pippin sends for Neo 2 on Linux: the symbols of layer 3, the text of
+// the dead keys before a vowel and before a space, and the letters of layer 1
+// and 2. Each lone accent stands before a letter that it could take, so the
+// text shows when the Mac starts a dead key of its own instead of typing the
+// accent.
+const NEO_TEXT = "[]{}\\/|@#$%&*<>=~ _…!?()-:;\"'+ ^a `a ´a ^ ` ´ âàá êèé äöüß ÄÖÜẞ ñç€";
+
+const keyboard: Scenario = {
+  about: "type Neo 2 text and press Command and Option, and see each reach a text view on a Mac with the Neo 2 layout",
+  async run(ctx) {
+    // A session lists the layouts that were there when it logged in, so the VM
+    // starts again with the layout in place.
+    await ctx.guest.put("/tmp/neo.keylayout", await readFile(`'${NEO_LAYOUT}'`));
+    await ctx.guest.sh(`sudo -n install -m 644 /tmp/neo.keylayout '${NEO_LAYOUT}'`);
+    await ctx.guest.sh('{ sudo -n sh -c "sleep 1; shutdown -r now" >/dev/null 2>&1 & }');
+    await waitFor("the VM to go down", 60_000, async () => ((await ctx.guest.ok("true", 5_000)) ? undefined : true));
+    await ctx.guest.waitSsh(120_000);
+    await ctx.guest.waitDesktop(120_000);
+    await connected(ctx, ["WindowServer", "screensharingd", "ScreensharingAgent"], false, async (session) => {
+      const log = await openTool(ctx, "keylog", [NEO]);
+      const source = (await log()).find((l) => l.startsWith("source "));
+      ctx.check("input source", source === `source ${NEO}`, source ?? "none");
+      session.send("pointer 200 200");
+      session.send("click");
+      await Bun.sleep(1000);
+      session.send(`type ${NEO_TEXT}`);
+      await Bun.sleep(3000);
+      const last = (await log()).findLast((l) => l.startsWith("text "));
+      const text = last ? (JSON.parse(last.slice(5)) as string) : undefined;
+      ctx.check("neo 2 text", text === NEO_TEXT, `typed ${JSON.stringify(text ?? null)}`);
+      for (const [combo, held] of [["opt", "option"], ["cmd", "command"]] as const) {
+        const before = (await log()).length;
+        session.send(`key ${combo}`);
+        await Bun.sleep(1000);
+        const got = (await log()).slice(before).filter((l) => l.startsWith("flags "));
+        ctx.check(`${combo} key`, got[0] === `flags ${held}`, got.join(", ") || "no modifier change");
+      }
+      await session.snapshot("1-keylog");
+    });
+  },
+};
+
 export const SCENARIOS: Record<string, Scenario> = {
   smoke,
+  scroll,
+  keyboard,
   fullscreen: fullscreen(true),
   "fullscreen-no-vdisplay": fullscreen(false),
   "fullscreen-own-display": fullscreen(true, true),

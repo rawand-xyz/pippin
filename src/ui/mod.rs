@@ -3,9 +3,12 @@
 //! display scaled to fit.
 
 pub mod dialog;
+mod inhibit;
 pub(crate) mod keymap;
+mod pointer;
 mod reconnect;
 mod render;
+mod scroll;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,29 +16,25 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::LogicalSize;
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes, WindowId};
 
-use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SCROLL_DOWN, BTN_SCROLL_UP, DisplayRequest};
+use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, DisplayRequest};
 use crate::session::{Config, CursorShape, Event, EventSink, Session};
+use inhibit::ShortcutInhibitor;
+use keymap::{KeyInput, Keyboard, Out};
+use pointer::Track;
 use reconnect::{OnEnd, Reconnector};
 use render::Renderer;
 
 /// Settle time before asking the host to follow a window resize; each
 /// request restarts the host's encoder.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(500);
-/// The host scrolls exactly one point per wheel click it receives (the
-/// press/release pairs are its only scroll input), so scrolling is sent as
-/// one click per point. A mouse-wheel notch becomes this many points.
-const SCROLL_POINTS_PER_LINE: f64 = 32.0;
-/// Clicks sent per input event at most; the rest carries over, so a hard
-/// flick doesn't flood the control channel in one go.
-const SCROLL_MAX_CLICKS_PER_EVENT: f64 = 200.0;
 
 pub struct Options {
     pub title: String,
@@ -91,6 +90,8 @@ struct App {
     opts: Options,
     proxy: EventLoopProxy<Tagged>,
     instance: wgpu::Instance,
+    /// Before `window`, so that it goes before the window's surface.
+    shortcuts: Option<ShortcutInhibitor>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     session: Option<Session>,
@@ -105,13 +106,12 @@ struct App {
     last_request: Option<DisplayRequest>,
     resize_due: Option<Instant>,
 
-    cursor_pos: Option<PhysicalPosition<f64>>,
+    /// The local pointer over the window, kept after it leaves.
+    pointer: Option<Track>,
     buttons: u8,
-    scroll_accum: f64,
+    scroll: scroll::Steps,
     modifiers: ModifiersState,
-    /// Keysym sent for each held physical key, so releases match presses
-    /// even if modifiers changed in between.
-    pressed: HashMap<KeyCode, u32>,
+    keyboard: Keyboard,
     cursors: HashMap<u32, CustomCursor>,
 }
 
@@ -138,67 +138,63 @@ impl App {
         }
     }
 
-    /// Window position → canvas pixel, clamped to the canvas.
-    fn canvas_point(&self, pos: PhysicalPosition<f64>) -> Option<(u16, u16)> {
+    /// The session and the canvas pixel under the cursor.
+    fn at_cursor(&self) -> Option<(&Session, u16, u16)> {
         let r = self.renderer.as_ref()?;
-        let vp = r.viewport()?;
-        let (iw, ih) = r.image_size()?;
-        let x = ((pos.x as f32 - vp.x) / vp.w * iw as f32).clamp(0.0, iw.saturating_sub(1) as f32);
-        let y = ((pos.y as f32 - vp.y) / vp.h * ih as f32).clamp(0.0, ih.saturating_sub(1) as f32);
-        Some((x as u16, y as u16))
+        let (x, y) = pointer::canvas(self.pointer?.pos, r.viewport()?, r.image_size()?);
+        Some((self.session.as_ref()?, x, y))
     }
 
     fn send_pointer(&self, buttons: u8) {
-        if let (Some(s), Some(pos)) = (&self.session, self.cursor_pos)
-            && let Some((x, y)) = self.canvas_point(pos) {
-                s.pointer(buttons, x, y);
-            }
+        if let Some((s, x, y)) = self.at_cursor() {
+            s.pointer(buttons, x, y);
+        }
     }
 
-    /// Scrolls by `points` (positive is up), carrying any fraction.
-    fn scroll(&mut self, points: f64) {
-        self.scroll_accum += points;
-        let clicks = self.scroll_accum.trunc().clamp(-SCROLL_MAX_CLICKS_PER_EVENT, SCROLL_MAX_CLICKS_PER_EVENT);
-        self.scroll_accum -= clicks;
-        let bit = if clicks > 0.0 { BTN_SCROLL_UP } else { BTN_SCROLL_DOWN };
-        for _ in 0..clicks.abs() as u32 {
-            // Each press/release pair is one wheel click on the host.
-            self.send_pointer(self.buttons | bit);
-            self.send_pointer(self.buttons);
+    fn scroll(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
+        let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
+        let steps = self.scroll.add(scroll::points(delta, scale), phase);
+        if let Some((s, x, y)) = self.at_cursor() {
+            s.scroll(self.buttons, x, y, steps);
         }
     }
 
     fn key(&mut self, ev: &KeyEvent) {
-        let Some(s) = &self.session else { return };
         let PhysicalKey::Code(code) = ev.physical_key else { return };
-        let down = ev.state == ElementState::Pressed;
-        if !down {
-            if let Some(ks) = self.pressed.remove(&code) {
-                s.key(false, ks);
-            }
-            return;
-        }
-        let m = self.modifiers;
-        let shortcut = m.control_key() || m.alt_key() || m.super_key();
-        let logical = if shortcut { ev.key_without_modifiers() } else { ev.logical_key.clone() };
-        let Some(ks) = keymap::keysym(ev.physical_key, &logical, self.opts.swap_ctrl_cmd) else {
-            return;
+        let base = ev.key_without_modifiers();
+        let input = KeyInput {
+            code,
+            location: ev.location,
+            down: ev.state == ElementState::Pressed,
+            repeat: ev.repeat,
+            logical: &ev.logical_key,
+            base: &base,
+            text: ev.text.as_deref(),
+            mods: self.modifiers,
         };
-        if let Some(prev) = self.pressed.insert(code, ks)
-            && prev != ks {
-                s.key(false, prev);
+        let out = self.keyboard.key(&input);
+        self.send_keys(out);
+    }
+
+    fn send_keys(&mut self, out: Vec<Out>) {
+        for o in out {
+            match (o, &self.session) {
+                (Out::Down(ks), Some(s)) => s.key(true, ks),
+                (Out::Up(ks), Some(s)) => s.key(false, ks),
+                (Out::ToggleShortcuts, _) => match &mut self.shortcuts {
+                    Some(i) => i.toggle(),
+                    None => tracing::info!("Ctrl+Alt+Shift+Z: this compositor keeps its shortcuts"),
+                },
+                (_, None) => {}
             }
-        s.key(true, ks);
+        }
     }
 
     /// Releases everything we hold on the host, e.g. when focus is lost
     /// mid-shortcut and the release would never arrive.
     fn release_all(&mut self) {
-        if let Some(s) = &self.session {
-            for (_, ks) in self.pressed.drain() {
-                s.key(false, ks);
-            }
-        }
+        let out = self.keyboard.release_all();
+        self.send_keys(out);
         if self.buttons != 0 {
             self.buttons = 0;
             self.send_pointer(0);
@@ -272,9 +268,9 @@ impl App {
         self.retry_due = Some(Instant::now() + delay);
         // Input state belongs to the dead session; the host forgets held
         // keys and buttons with it.
-        self.pressed.clear();
+        self.keyboard.forget();
         self.buttons = 0;
-        self.scroll_accum = 0.0;
+        self.scroll = scroll::Steps::default();
         self.cursors.clear();
         if let Some(w) = &self.window {
             w.set_cursor_visible(true);
@@ -336,6 +332,7 @@ impl ApplicationHandler<Tagged> for App {
             Ok(r) => self.renderer = Some(r),
             Err(e) => return self.fail(el, format!("{e:#}")),
         }
+        self.shortcuts = ShortcutInhibitor::new(&window);
         self.window = Some(window);
         self.start_session();
     }
@@ -418,16 +415,28 @@ impl ApplicationHandler<Tagged> for App {
                         tracing::trace!("uploaded {n} tiles in {:.2} ms", started.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
-                if let Some(r) = &mut self.renderer {
-                    r.render();
+                if let Some(r) = &mut self.renderer
+                    && r.render()
+                    && let Some(s) = &self.session
+                {
+                    s.presented();
                 }
             }
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.key(&event),
+            WindowEvent::CursorEntered { .. } => self.pointer = None,
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = Some(position);
+                let now = Instant::now();
+                self.pointer = Some(self.pointer.map_or(Track::at(position, now), |t| t.moved(position, now)));
                 self.send_pointer(self.buttons);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                let (size, now) = (self.window.as_ref().map(|w| w.inner_size()), Instant::now());
+                if let Some(exit) = self.pointer.zip(size).and_then(|(t, size)| t.exit(size, now)) {
+                    self.pointer = Some(Track::at(exit, now));
+                    self.send_pointer(self.buttons);
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let bit = match button {
@@ -442,17 +451,7 @@ impl ApplicationHandler<Tagged> for App {
                 }
                 self.send_pointer(self.buttons);
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let points = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as f64 * SCROLL_POINTS_PER_LINE,
-                    // Physical pixels → logical points, so the remote
-                    // content tracks the fingers 1:1.
-                    MouseScrollDelta::PixelDelta(p) => {
-                        p.y / self.window.as_ref().map_or(1.0, |w| w.scale_factor())
-                    }
-                };
-                self.scroll(points);
-            }
+            WindowEvent::MouseWheel { delta, phase, .. } => self.scroll(delta, phase),
             _ => {}
         }
     }
@@ -501,11 +500,13 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
         event_loop.owned_display_handle(),
     )));
     let reconnect = opts.reconnect;
+    let keyboard = Keyboard::new(opts.swap_ctrl_cmd);
     let mut app = App {
         cfg,
         opts,
         proxy: event_loop.create_proxy(),
         instance,
+        shortcuts: None,
         window: None,
         renderer: None,
         session: None,
@@ -515,11 +516,11 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
         error: None,
         last_request: None,
         resize_due: None,
-        cursor_pos: None,
+        pointer: None,
         buttons: 0,
-        scroll_accum: 0.0,
+        scroll: scroll::Steps::default(),
         modifiers: ModifiersState::empty(),
-        pressed: HashMap::new(),
+        keyboard,
         cursors: HashMap::new(),
     };
     event_loop.run_app_on_demand(&mut app)?;
