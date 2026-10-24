@@ -68,23 +68,39 @@ pub struct DisplayRequest {
     pub height: u32,
     /// Backing pixels per point. 1.0 = flat, 2.0 = Retina.
     pub scale: f64,
+    /// Largest backing size in pixels. The descriptor sends it to the host
+    /// as the maximum size of the display.
+    pub max_backing: (u32, u32),
 }
 
 impl DisplayRequest {
-    pub const MAX_BACKING: (u32, u32) = (3840, 2160);
+    /// Smallest logical size we ask for.
+    const MIN_POINTS: (u32, u32) = (640, 360);
 
-    /// Picks the logical size and scale so the host's backing store matches
-    /// `pixels` as closely as its 3840×2160 cap allows.
-    pub fn for_pixels(px_w: u32, px_h: u32, scale: f64) -> Self {
-        let scale = scale.clamp(0.5, 3.0);
-        let (max_w, max_h) = Self::MAX_BACKING;
+    /// Picks the logical size and scale so that the host's backing store
+    /// matches `px_w`×`px_h` pixels as closely as `max_backing` allows. The
+    /// backing never exceeds `max_backing`: when the smallest logical size
+    /// does not fit at `scale`, the scale goes down.
+    pub fn for_pixels(px_w: u32, px_h: u32, scale: f64, max_backing: (u32, u32)) -> Self {
+        let (max_w, max_h) = max_backing;
+        let (min_w, min_h) = Self::MIN_POINTS;
+        let scale = scale
+            .clamp(0.5, 3.0)
+            .min(max_w as f64 / min_w as f64)
+            .min(max_h as f64 / min_h as f64);
         let fit = (max_w as f64 / px_w.max(1) as f64)
             .min(max_h as f64 / px_h.max(1) as f64)
             .min(1.0);
-        let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
-        let width = even(px_w as f64 * fit / scale).max(640);
-        let height = even(px_h as f64 * fit / scale).max(360);
-        Self { width, height, scale }
+        // The nearest even size, but at most the largest even size whose
+        // backing fits.
+        let points = |px: u32, max: u32, min: u32| {
+            let near = (px as f64 * fit / scale / 2.0).round() as u32 * 2;
+            let most = (max as f64 / scale / 2.0) as u32 * 2;
+            near.min(most).max(min)
+        };
+        let width = points(px_w, max_w, min_w);
+        let height = points(px_h, max_h, min_h);
+        Self { width, height, scale, max_backing }
     }
 
     pub fn backing(&self) -> (u32, u32) {
@@ -113,8 +129,8 @@ pub fn set_display_configuration(req: &DisplayRequest) -> Vec<u8> {
     put32(&mut di, 0x7E, 4); // virtual display
     di[0x82..0x86].copy_from_slice(&369.454_56_f32.to_be_bytes());
     di[0x86..0x8A].copy_from_slice(&207.818_17_f32.to_be_bytes());
-    put32(&mut di, 0x8A, DisplayRequest::MAX_BACKING.0);
-    put32(&mut di, 0x8E, DisplayRequest::MAX_BACKING.1);
+    put32(&mut di, 0x8A, req.max_backing.0);
+    put32(&mut di, 0x8E, req.max_backing.1);
     put16(&mut di, 0x92, 0);
     put16(&mut di, 0x94, 0);
     put32(&mut di, 0x96, 7);
@@ -290,8 +306,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_configuration_layout() {
-        let req = DisplayRequest { width: 1920, height: 1080, scale: 2.0 };
+    fn display_configuration_advertises_the_6k_maximum() {
+        let req = DisplayRequest::for_pixels(6016, 3384, 2.0, (6016, 3384));
         let m = set_display_configuration(&req);
         let di_size = 0x9C + 28 * 5;
         assert_eq!(m.len(), 12 + di_size);
@@ -301,22 +317,65 @@ mod tests {
         assert_eq!(be16(di, 0) as usize, di_size);
         assert_eq!(be32(di, 0x7A), 1);
         assert_eq!(be32(di, 0x7E), 4);
-        assert_eq!(be32(di, 0x8A), 3840);
+        assert_eq!((be32(di, 0x8A), be32(di, 0x8E)), (6016, 3384));
         assert_eq!(be32(di, 0x96), 7);
         assert_eq!(be16(di, 0x9A), 5);
         // First mode is the requested size at 2× backing.
-        assert_eq!((be32(di, 0x9C), be32(di, 0xA0), be32(di, 0xA4), be32(di, 0xA8)), (3840, 2160, 1920, 1080));
+        assert_eq!((be32(di, 0x9C), be32(di, 0xA0), be32(di, 0xA4), be32(di, 0xA8)), (6016, 3384, 3008, 1692));
         assert_eq!(f32::from_be_bytes(di[0x82..0x86].try_into().unwrap()), 369.454_56);
     }
 
     #[test]
-    fn display_request_respects_cap() {
-        let r = DisplayRequest::for_pixels(5120, 2880, 1.0);
-        let (bw, bh) = r.backing();
-        assert!(bw <= 3840 && bh <= 2160, "{bw}x{bh}");
-        let r = DisplayRequest::for_pixels(2560, 1440, 2.0);
+    fn display_request_fills_a_6k_monitor_at_2x() {
+        let r = DisplayRequest::for_pixels(6016, 3384, 2.0, (6016, 3384));
+        assert_eq!((r.width, r.height), (3008, 1692));
+        assert_eq!(r.backing(), (6016, 3384));
+        let r = DisplayRequest::for_pixels(2560, 1440, 2.0, (6016, 3384));
         assert_eq!((r.width, r.height), (1280, 720));
         assert_eq!(r.backing(), (2560, 1440));
+    }
+
+    #[test]
+    fn display_requests_for_a_portrait_and_a_fullscreen_window_advertise_one_landscape_maximum() {
+        // macOS 27 keeps the first maximum of a session. A portrait maximum
+        // of 2880x5120 made it answer the later fullscreen request with
+        // 1920x1080 pixels.
+        let max = (5120, 2880);
+        let portrait = DisplayRequest::for_pixels(2880, 3184, 2.0, max);
+        let fullscreen = DisplayRequest::for_pixels(6016, 3384, 2.0, max);
+        assert_eq!((portrait.width, portrait.height), (1302, 1440));
+        assert_eq!(fullscreen.backing(), (5120, 2880));
+        for r in [portrait, fullscreen] {
+            let m = set_display_configuration(&r);
+            let di = &m[12..];
+            assert_eq!((be32(di, 0x8A), be32(di, 0x8E)), (5120, 2880));
+        }
+    }
+
+    #[test]
+    fn display_request_shrinks_a_6k_window_into_a_5k_maximum() {
+        let r = DisplayRequest::for_pixels(6016, 3304, 2.0, (5120, 2880));
+        assert_eq!((r.width, r.height), (2560, 1406));
+        assert_eq!(r.backing(), (5120, 2812));
+    }
+
+    #[test]
+    fn display_request_rounds_an_odd_half_down_into_the_maximum() {
+        // 1366 / 2 = 683 points; the nearest even 684 would need 1368 pixels.
+        let r = DisplayRequest::for_pixels(1366, 768, 2.0, (1366, 768));
+        assert_eq!((r.width, r.height), (682, 384));
+        assert_eq!(r.backing(), (1364, 768));
+    }
+
+    #[test]
+    fn display_request_lowers_the_scale_when_the_smallest_size_exceeds_the_maximum() {
+        // 640×360 points at 2× would need 1280×720 pixels.
+        let r = DisplayRequest::for_pixels(1280, 720, 2.0, (640, 360));
+        assert_eq!((r.width, r.height, r.scale), (640, 360, 1.0));
+        assert_eq!(r.backing(), (640, 360));
+        let r = DisplayRequest::for_pixels(6016, 3304, 2.0, (1024, 576));
+        assert_eq!((r.width, r.height), (640, 360));
+        assert_eq!(r.backing(), (1024, 576));
     }
 
     #[test]

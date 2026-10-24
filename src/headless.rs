@@ -27,7 +27,9 @@ impl EventSink for ChannelSink {
 pub fn run(cfg: Config, size: (u32, u32), scale: f64) -> Result<()> {
     let op = cfg.op.clone();
     let pixels = |v: u32| (v as f64 * scale).round() as u32;
-    let request = move || crate::ui::display_request((pixels(size.0), pixels(size.1)), scale, op.lock().render_scale);
+    // No monitor and no GPU texture limit: the Mac display never grows past the requested size.
+    let full = (pixels(size.0), pixels(size.1));
+    let request = move || crate::ui::display_request(full, scale, op.lock().render_scale, full);
     let (tx, rx) = crossbeam_channel::unbounded();
     let session = Session::start(cfg, request(), Arc::new(ChannelSink(tx)));
     let result = serve(&session, &rx, request);
@@ -49,7 +51,9 @@ fn serve(session: &Session, events: &Receiver<Event>, request: impl Fn() -> Disp
             Event::Cursor(_) => {}
             Event::Closed(reason) => return closed(reason, &snapshots),
             Event::Lost(reason) => bail!(reason),
-            Event::Reconfigure => session.resize(request()),
+            Event::Reconfigure => {
+                session.resize(request());
+            }
             Event::Snapshot(path) => snapshots.push(path),
         }
         // A snapshot asked for before the first whole picture waits for it.

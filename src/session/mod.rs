@@ -320,6 +320,10 @@ impl Shared {
 pub struct Session {
     shared: Arc<Shared>,
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The maximum of the first display request. macOS 27 keeps it for
+    /// the whole session, and answers a later request that exceeds it
+    /// with a smaller display of its own choice.
+    max_backing: (u32, u32),
 }
 
 impl Session {
@@ -328,7 +332,7 @@ impl Session {
     pub fn start(cfg: Config, display: DisplayRequest, sink: Arc<dyn EventSink>) -> Self {
         let shared = Arc::new(Shared::new(cfg.op.clone(), sink));
         let threads = Arc::new(Mutex::new(Vec::new()));
-        let session = Session { shared: shared.clone(), threads: threads.clone() };
+        let session = Session { shared: shared.clone(), threads: threads.clone(), max_backing: display.max_backing };
         let main = thread::Builder::new()
             .name("control".into())
             .spawn(move || {
@@ -374,18 +378,25 @@ impl Session {
         }
     }
 
-    /// Asks the host to resize its virtual display.
-    pub fn resize(&self, req: DisplayRequest) {
-        if let Some(c) = self.control() {
-            tracing::info!(
-                "requesting {}x{} @{}x (backing {:?})",
-                req.width,
-                req.height,
-                req.scale,
-                req.backing()
-            );
-            c.send(&messages::set_display_configuration(&req));
-        }
+    /// The maximum that each display request of this session must carry.
+    pub fn max_backing(&self) -> (u32, u32) {
+        self.max_backing
+    }
+
+    /// Asks the host to resize its virtual display. Returns false before
+    /// the control connection is up, when nothing is sent.
+    pub fn resize(&self, req: DisplayRequest) -> bool {
+        let Some(c) = self.control() else { return false };
+        tracing::info!(
+            width = req.width,
+            height = req.height,
+            scale = req.scale,
+            backing = ?req.backing(),
+            max = ?req.max_backing,
+            "requesting display"
+        );
+        c.send(&messages::set_display_configuration(&req));
+        true
     }
 
     /// Stops every session thread and waits for them, so the sockets are
