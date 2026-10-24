@@ -2,7 +2,7 @@
 //! the host's virtual display sized to the window.
 
 pub mod dialog;
-mod keymap;
+pub(crate) mod keymap;
 mod reconnect;
 mod render;
 
@@ -48,6 +48,15 @@ pub struct Options {
     pub swap_ctrl_cmd: bool,
     /// Start a new session when an established one drops.
     pub reconnect: bool,
+}
+
+/// The display to ask the host for: `pixels` at `scale` backing pixels per
+/// point, rendered at `render_scale`.
+pub(crate) fn display_request(pixels: (u32, u32), scale: f64, render_scale: f64) -> DisplayRequest {
+    // Same logical size, fewer backing pixels: the Mac lays out as usual
+    // and we scale up its smaller picture.
+    let px = |v: u32| (v as f64 * render_scale).round() as u32;
+    DisplayRequest::for_pixels(px(pixels.0), px(pixels.1), scale * render_scale)
 }
 
 static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -102,11 +111,7 @@ struct App {
 impl App {
     fn display_request(&self, size: PhysicalSize<u32>, scale_factor: f64) -> DisplayRequest {
         let scale = self.opts.scale.unwrap_or(if scale_factor >= 1.5 { 2.0 } else { 1.0 });
-        // Same logical size, fewer backing pixels: the Mac lays out as usual
-        // and we scale up its smaller picture.
-        let r = self.cfg.op.lock().render_scale;
-        let px = |v: u32| (v as f64 * r).round() as u32;
-        DisplayRequest::for_pixels(px(size.width), px(size.height), scale * r)
+        display_request((size.width, size.height), scale, self.cfg.op.lock().render_scale)
     }
 
     fn send_resize(&mut self) {
@@ -340,6 +345,8 @@ impl ApplicationHandler<Tagged> for App {
             // A new render scale: same path as a resize (the host's layout
             // answer makes the session re-offer).
             Event::Reconfigure => self.send_resize(),
+            // The picture is on the GPU here; only --headless keeps it.
+            Event::Snapshot(path) => tracing::warn!("snapshot {}: only --headless takes snapshots", path.display()),
         }
     }
 

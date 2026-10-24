@@ -13,7 +13,8 @@
 //!   acks), the audio keepalive and the cursor poll on a 500 ms tick.
 //! * `clipboard` mirrors text between the local and remote pasteboards.
 //! * `control-fifo` (debug, `PIPPIN_CONTROL_FIFO`) switches the operating
-//!   point mid-session; `stats-json` (`--stats-json`) writes metrics.
+//!   point mid-session, sends input and asks for snapshots; `stats-json`
+//!   (`--stats-json`) writes metrics.
 
 mod control;
 mod media;
@@ -90,6 +91,8 @@ pub struct Config {
     pub control_fifo: Option<PathBuf>,
     /// Plays the Mac's sound; `None` asks the host not to send any.
     pub audio: Option<crate::audio::Player>,
+    /// Mirror the local clipboard and the host pasteboard.
+    pub clipboard: bool,
 }
 
 pub type AuthHook = Arc<dyn Fn(bool) + Send + Sync>;
@@ -118,7 +121,8 @@ pub enum Event {
     Canvas { width: u32, height: u32 },
     Cursor(CursorShape),
     /// The session ended for good: bad credentials, a broken decoder, or a
-    /// failure while first connecting.
+    /// failure while first connecting. `None` is a clean end, such as
+    /// `quit` on the control FIFO.
     Closed(Option<String>),
     /// The connection failed or dropped in a way a fresh session may fix
     /// (host asleep, network change, timeout).
@@ -126,6 +130,8 @@ pub enum Event {
     /// The operating point's render scale changed; request the display
     /// again.
     Reconfigure,
+    /// The control FIFO asks for the picture as a PNG file at this path.
+    Snapshot(PathBuf),
 }
 
 pub trait EventSink: Send + Sync + 'static {
@@ -182,6 +188,15 @@ impl Control {
         }
     }
 
+    pub fn key(&self, down: bool, keysym: u32) {
+        self.send(&messages::key_event(down, keysym));
+    }
+
+    /// Pointer position in canvas pixels plus the RFB button mask.
+    pub fn pointer(&self, buttons: u8, x: u16, y: u16) {
+        self.send(&messages::encrypted_pointer_event(&self.record_key, buttons, x, y));
+    }
+
     pub fn reoffer(&self) {
         let msg = self.offer.lock().message();
         self.send(&msg);
@@ -200,6 +215,13 @@ impl Clock {
     fn now_ms(&self) -> u64 {
         self.0.elapsed().as_millis() as u64
     }
+}
+
+/// The size of the Mac display in points and in stream pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DisplaySize {
+    points: (u16, u16),
+    pixels: (u16, u16),
 }
 
 /// State shared by the session threads.
@@ -226,6 +248,9 @@ pub struct Shared {
     /// since the video receiver last logged it.
     recovered_damaged: AtomicU32,
     canvas: Mutex<Option<(u32, u32)>>,
+    /// The latest display layout, to place the pointer of the control FIFO
+    /// in points.
+    display: Mutex<Option<DisplaySize>>,
     /// The control connection while the handshake runs, for shutdown().
     connecting: Mutex<Option<TcpStream>>,
     /// Clones of the media sockets, so shutdown() can wake their readers.
@@ -235,6 +260,31 @@ pub struct Shared {
 }
 
 impl Shared {
+    fn new(op: SharedOp, sink: Arc<dyn EventSink>) -> Self {
+        Shared {
+            clock: Clock(Instant::now()),
+            stop: AtomicBool::new(false),
+            control: OnceLock::new(),
+            sink,
+            frames: Arc::new(FrameStore::default()),
+            tiles: AtomicU32::new(crate::proto::offers::TILES_PER_FRAME as u32),
+            last_video_packet: AtomicU64::new(0),
+            last_frame: AtomicU64::new(0),
+            renegotiated: AtomicU64::new(0),
+            tile_ssrcs: Mutex::new(Vec::new()),
+            rx_stats: Mutex::new(HashMap::new()),
+            sender_reports: Mutex::new(HashMap::new()),
+            rtt: Mutex::new(None),
+            recovered_damaged: AtomicU32::new(0),
+            canvas: Mutex::new(None),
+            display: Mutex::new(None),
+            connecting: Mutex::new(None),
+            udp: Mutex::new(Vec::new()),
+            op,
+            metrics: metrics::Metrics::default(),
+        }
+    }
+
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
@@ -276,27 +326,7 @@ impl Session {
     /// Starts connecting in the background. Progress and failures arrive as
     /// [`Event`]s.
     pub fn start(cfg: Config, display: DisplayRequest, sink: Arc<dyn EventSink>) -> Self {
-        let shared = Arc::new(Shared {
-            clock: Clock(Instant::now()),
-            stop: AtomicBool::new(false),
-            control: OnceLock::new(),
-            sink,
-            frames: Arc::new(FrameStore::default()),
-            tiles: AtomicU32::new(crate::proto::offers::TILES_PER_FRAME as u32),
-            last_video_packet: AtomicU64::new(0),
-            last_frame: AtomicU64::new(0),
-            renegotiated: AtomicU64::new(0),
-            tile_ssrcs: Mutex::new(Vec::new()),
-            rx_stats: Mutex::new(HashMap::new()),
-            sender_reports: Mutex::new(HashMap::new()),
-            rtt: Mutex::new(None),
-            recovered_damaged: AtomicU32::new(0),
-            canvas: Mutex::new(None),
-            connecting: Mutex::new(None),
-            udp: Mutex::new(Vec::new()),
-            op: cfg.op.clone(),
-            metrics: metrics::Metrics::default(),
-        });
+        let shared = Arc::new(Shared::new(cfg.op.clone(), sink));
         let threads = Arc::new(Mutex::new(Vec::new()));
         let session = Session { shared: shared.clone(), threads: threads.clone() };
         let main = thread::Builder::new()
@@ -333,14 +363,14 @@ impl Session {
 
     pub fn key(&self, down: bool, keysym: u32) {
         if let Some(c) = self.control() {
-            c.send(&messages::key_event(down, keysym));
+            c.key(down, keysym);
         }
     }
 
     /// Pointer position in canvas pixels plus the RFB button mask.
     pub fn pointer(&self, buttons: u8, x: u16, y: u16) {
         if let Some(c) = self.control() {
-            c.send(&messages::encrypted_pointer_event(&c.record_key, buttons, x, y));
+            c.pointer(buttons, x, y);
         }
     }
 
@@ -472,6 +502,16 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     let ctrl_dest = SocketAddrV4::new(cfg.host, cfg.port);
     let video_dest = SocketAddrV4::new(cfg.host, cfg.port + 1);
 
+    // A FIFO that can't open ends the session before it reaches the Mac:
+    // a scripted run without its control would stream with nobody driving.
+    let fifo = match &cfg.control_fifo {
+        Some(path) => {
+            let f = operating::open_fifo(path).with_context(|| format!("PIPPIN_CONTROL_FIFO {}", path.display()))?;
+            tracing::info!("reading control commands from {}", path.display());
+            Some(f)
+        }
+        None => None,
+    };
     // The media burst starts right after the answer, so the UDP sockets
     // must exist before the handshake.
     let ctrl_sock = bind_udp(cfg.port)?;
@@ -578,6 +618,12 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     let (fb_tx, fb_rx): (Sender<Feedback>, Receiver<Feedback>) = crossbeam_channel::unbounded();
     let (dec_tx, dec_rx) = crossbeam_channel::bounded(256);
     let (clip_tx, clip_rx) = crossbeam_channel::unbounded();
+    // Apply what came with the answer, such as the display layout, before
+    // any thread acts on it: the FIFO's pointer needs the layout.
+    let mut rx = control::ControlReader::new(shared.clone(), control.clone(), clip_tx, fb_tx.clone());
+    for msg in neg.pending {
+        rx.dispatch(&msg);
+    }
 
     // The host seals its RTCP with the video key on both ports.
     let srtcp = Arc::new(Mutex::new(SrtcpReceiver::new(&neg.offer.video_key_s)));
@@ -609,32 +655,28 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         let offer = neg.offer.clone();
         spawn(threads, "feedback", move || media::feedback(shared, sockets, offer, fb_rx, dec_tx));
     }
-    {
-        let (shared, control) = (shared.clone(), control.clone());
-        spawn(threads, "clipboard", move || crate::clipboard::run(shared, control, clip_rx));
+    if cfg.clipboard {
+        let (s, c) = (shared.clone(), control.clone());
+        spawn(threads, "clipboard", move || crate::clipboard::run(s, c, clip_rx));
+        // Subscribe to pasteboard changes and prime with the current contents.
+        control.send(&crate::proto::clipboard::enable_auto_pasteboard());
+        control.send(&crate::proto::clipboard::request_pasteboard());
     }
-    if let Some(path) = cfg.control_fifo.clone() {
-        let (shared, fb) = (shared.clone(), fb_tx.clone());
-        spawn(threads, "control-fifo", move || operating::control_fifo(shared, path, fb));
+    if let Some(fifo) = fifo {
+        let (shared, control, fb) = (shared.clone(), control.clone(), fb_tx.clone());
+        spawn(threads, "control-fifo", move || operating::control_fifo(shared, control, fifo, fb));
     }
     if let Some(path) = cfg.stats_json.clone() {
         let shared = shared.clone();
         spawn(threads, "stats-json", move || metrics::writer(shared, path));
     }
 
-    // Subscribe to pasteboard changes and prime with the current contents.
-    control.send(&crate::proto::clipboard::enable_auto_pasteboard());
-    control.send(&crate::proto::clipboard::request_pasteboard());
     shared.sink.emit(Event::Connected);
     {
         let (shared, host, answered, resumed) = (shared.clone(), cfg.host, neg.canvas.is_some(), cfg.resumed);
         spawn(threads, "video-watchdog", move || video_watchdog(shared, host, answered, resumed));
     }
 
-    let mut rx = control::ControlReader::new(shared.clone(), control, clip_tx, fb_tx);
-    for msg in neg.pending {
-        rx.dispatch(&msg);
-    }
     rx.run(&mut reader, neg.opener)
 }
 

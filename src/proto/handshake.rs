@@ -31,6 +31,8 @@ pub enum SessionMode {
     Alt,
 }
 
+pub type OnOpen = Box<dyn Fn(&TcpStream) + Send + Sync>;
+
 pub struct ConnectParams {
     pub addr: SocketAddrV4,
     pub user: String,
@@ -41,7 +43,7 @@ pub struct ConnectParams {
     pub offer: OfferOptions,
     /// Shown each control connection as soon as it's open, so the caller
     /// can shut it down to abort a handshake stuck waiting on the host.
-    pub on_open: Option<Box<dyn Fn(&TcpStream) + Send + Sync>>,
+    pub on_open: Option<OnOpen>,
     /// Polled before each new connection; true abandons the handshake.
     pub stopped: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
@@ -348,13 +350,17 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
             Opened::Message(m) => m,
             Opened::BadMac => continue,
         };
-        match (msg.first(), parse_answer(&msg)) {
-            (Some(0x00), Some(c)) if !c.is_degenerate() => {
+        let answer = if msg.first() == Some(&0x00) { parse_answer(&msg) } else { None };
+        // The reader still gets the whole message: the update that carries
+        // the answer can carry the display layout and a cursor too.
+        pending.push(msg);
+        match answer {
+            Some(c) if !c.is_degenerate() => {
                 tracing::info!("encoder canvas {}x{} in {} tiles", c.width, c.height, c.tiles);
                 canvas = Some(c);
                 break;
             }
-            (Some(0x00), Some(c)) => {
+            Some(c) => {
                 tracing::debug!("degenerate canvas answer; re-offering");
                 canvas = Some(c);
                 if retries >= DEGENERATE_RETRIES {
@@ -366,7 +372,7 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
                 s.write_all(&sealer.seal(&offer_msg))?;
                 deadline = Instant::now() + ANSWER_TIMEOUT;
             }
-            _ => pending.push(msg),
+            None => {}
         }
     }
 
