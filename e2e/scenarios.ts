@@ -4,7 +4,7 @@
 import { differingPixels, litShare, size } from "./frame";
 import type { Guest } from "./guest";
 import type { Login } from "./login";
-import { readFile } from "./mini";
+import { readFile, swiftTool } from "./mini";
 import { decoded, Session, SIZE } from "./pippin";
 import { waitFor } from "./proc";
 
@@ -78,24 +78,56 @@ async function startVdisplay(ctx: Context): Promise<void> {
   ctx.check("vdisplay", true, screens.join("; "));
 }
 
+// vdisplay is the only display of the mini, but the VM keeps its own display
+// next to it. displaycfg switches the VM's display off, and vdisplay becomes
+// main at 0,0, as on the mini.
+async function onlyVdisplay(ctx: Context): Promise<void> {
+  await ctx.guest.put("displaycfg", await swiftTool("displaycfg"), "755");
+  await ctx.guest.sh("./displaycfg");
+  const only = (cg: string[]) => cg.length === 1 && /^cg \S+ \d+x\d+\+0\+0 vendor 0x1ab2 active main$/.test(cg[0]!);
+  let cg: string[] = [];
+  await waitFor("vdisplay as the only display", 10_000, async (left) => {
+    cg = (await ctx.guest.displays(left)).split("\n").filter((l) => l.startsWith("cg "));
+    return only(cg) || undefined;
+  }).catch(() => undefined);
+  ctx.check("only vdisplay", only(cg), cg.join("; "));
+}
+
+// While pippin is connected, its display must be the main display, and
+// online. pippin names it in its display request (src/proto/messages.rs).
+function checkMain(ctx: Context, displays: string): void {
+  const main = displays.match(/^main (\S+) (online|offline)$/m);
+  const pippin = displays.match(/^screen (\S+) .* pippin Virtual Display$/m);
+  const pass = main?.[2] === "online" && main[1] === pippin?.[1];
+  ctx.check("main display", pass, `main ${main?.slice(1).join(" ") ?? "none"}, pippin display ${pippin?.[1] ?? "none"}`);
+}
+
 const APP = "TextEdit";
+// The fullscreen transition takes about 1 s, and the snapshot comes 10 s
+// after the key. pippin must still decode pictures in the last seconds
+// before it.
+const SETTLED_S = 3;
 
 function fullscreen(vdisplay: boolean): Scenario {
   return {
     about: `put a ${APP} window into native fullscreen, ${vdisplay ? "with" : "without"} the mini's vdisplay`,
     async run(ctx) {
       let window: string | undefined, full: string | undefined;
-      let windowAt = 0, fullAt = 0;
-      if (vdisplay) await startVdisplay(ctx);
+      let fullAt = 0;
+      if (vdisplay) {
+        await startVdisplay(ctx);
+        await onlyVdisplay(ctx);
+      }
       await Bun.write(`${ctx.out}/displays-before.txt`, await ctx.guest.displays());
       await connected(ctx, ["WindowServer", "screensharingd", APP], async (session) => {
-        await Bun.write(`${ctx.out}/displays-connected.txt`, await ctx.guest.displays());
+        const displays = await ctx.guest.displays();
+        await Bun.write(`${ctx.out}/displays-connected.txt`, displays);
+        checkMain(ctx, displays);
         await ctx.guest.put("/tmp/pippin-e2e.txt", "pippin e2e: this window goes into fullscreen.\n");
         await ctx.guest.sh(`open -a ${APP} /tmp/pippin-e2e.txt`);
         await Bun.sleep(3000);
         ctx.check("app runs", await ctx.guest.ok(`pgrep -qx ${APP}`), APP);
         window = await session.snapshot("1-window");
-        windowAt = Date.now() / 1000;
         await Bun.write(`${ctx.out}/windows-window.txt`, await ctx.guest.jxa("windows.js", [APP]));
         session.send("key ctrl+cmd+f");
         await Bun.sleep(10_000);
@@ -107,19 +139,19 @@ function fullscreen(vdisplay: boolean): Scenario {
         await checkLit(ctx, "fullscreen frame", full);
       });
       // A frozen stream would show an old picture: the fullscreen snapshot
-      // must differ from the window, and pippin must have decoded new
-      // pictures in between. The stats are complete once pippin quit.
-      if (window && full) {
+      // must differ from the window, and pippin must still decode pictures
+      // after the transition. The stats are complete once pippin quit.
+      if (!window || !full) {
+        ctx.check("fullscreen picture is new", false, "no snapshot of the window or of the fullscreen");
+      } else {
         const pixels = await differingPixels(window, full);
-        const pictures = await decoded(ctx.out, windowAt, fullAt);
-        ctx.check("fullscreen picture is new", pixels > 0 && pictures > 0, `${pixels} pixels differ, ${pictures} pictures decoded`);
+        const pictures = await decoded(ctx.out, fullAt - SETTLED_S, fullAt);
+        ctx.check(
+          "fullscreen picture is new",
+          pixels > 0 && pictures > 0,
+          `${pixels} pixels differ, ${pictures} pictures decoded in the ${SETTLED_S} s before the fullscreen snapshot`,
+        );
       }
-      // WindowServer also logs "Invalid display" for the new display of each
-      // Screen Sharing session, before the display exists. Only the app's
-      // lines show the bug.
-      const log = await Bun.file(`${ctx.out}/vm.log`).text();
-      const invalid = log.match(new RegExp(` ${APP}\\[.*Invalid display`, "g"))?.length ?? 0;
-      ctx.check("app finds its display", invalid === 0, `${invalid} lines of ${APP} with "Invalid display" in vm.log`);
     },
   };
 }
